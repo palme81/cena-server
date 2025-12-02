@@ -96,6 +96,14 @@ const disconnectedPlayers = {};
 // Tiempo de gracia para reconexión (30 segundos)
 const RECONNECT_TIMEOUT = 30000;
 
+// Helper para actualizar la fase del juego
+const setRoomPhase = (roomId, phase) => {
+  if (rooms[roomId]) {
+    rooms[roomId].phase = phase;
+    console.log(`Sala ${roomId} cambió a fase: ${phase}`);
+  }
+};
+
 io.on('connection', (socket) => {
 
   // Intentar reconectar jugador
@@ -110,22 +118,45 @@ io.on('connection', (socket) => {
     const disconnectKey = `${roomId}_${playerName}`;
     const disconnectedData = disconnectedPlayers[disconnectKey];
     
-    if (disconnectedData) {
-      // Reconectar: actualizar el socket ID del jugador
-      const player = room.players.find(p => p.name === playerName);
+    // También buscar si el jugador existe en la sala (puede que no esté marcado como desconectado aún)
+    let player = room.players.find(p => p.name === playerName);
+    
+    if (disconnectedData || player) {
       if (player) {
         const oldSocketId = player.id;
         player.id = socket.id;
         player.disconnected = false;
         
-        // Limpiar timeout de eliminación
-        if (disconnectedData.timeout) {
+        // Limpiar timeout de eliminación si existe
+        if (disconnectedData && disconnectedData.timeout) {
           clearTimeout(disconnectedData.timeout);
+          delete disconnectedPlayers[disconnectKey];
         }
-        delete disconnectedPlayers[disconnectKey];
         
         // Unirse a la sala
         socket.join(roomId);
+        
+        // Determinar la fase actual para la navegación
+        const currentPhase = room.phase || 'lobby';
+        const phaseMap = {
+          'lobby': '/lobby',
+          'roleReveal': '/role-reveal',
+          'day': '/day-phase',
+          'leaderVote': '/leader-vote',
+          'wordGuess': '/word-guess',
+          'eliminationVote': '/elimination-vote',
+          'night': '/night-phase',
+          'gameOver': '/multiplayer-game-over'
+        };
+        
+        // Obtener el fragmento correcto
+        const fragment = room.fragments ? (room.fragments[socket.id] || room.fragments[oldSocketId]) : null;
+        
+        // Actualizar fragmentos con nuevo socket ID
+        if (room.fragments && room.fragments[oldSocketId] && oldSocketId !== socket.id) {
+          room.fragments[socket.id] = room.fragments[oldSocketId];
+          delete room.fragments[oldSocketId];
+        }
         
         // Enviar estado actual al jugador reconectado
         callback({ 
@@ -135,12 +166,16 @@ io.on('connection', (socket) => {
             role: player.role,
             name: player.name,
             roomId: roomId,
-            fragment: room.fragments ? room.fragments[socket.id] || room.fragments[oldSocketId] : null,
-            isHost: room.host === oldSocketId
+            fragment: fragment,
+            isHost: room.host === oldSocketId || room.host === socket.id,
+            isAlive: player.isAlive
           },
           roomState: {
-            phase: room.phase || 'lobby',
-            day: room.day || 1
+            phase: currentPhase,
+            navigateTo: phaseMap[currentPhase] || '/day-phase',
+            day: room.day || 1,
+            leader: room.leader,
+            keyword: player.role === 'ASESINO' ? room.keyword : null
           }
         });
         
@@ -149,13 +184,7 @@ io.on('connection', (socket) => {
           room.host = socket.id;
         }
         
-        // Actualizar fragmentos con nuevo socket ID
-        if (room.fragments && room.fragments[oldSocketId]) {
-          room.fragments[socket.id] = room.fragments[oldSocketId];
-          delete room.fragments[oldSocketId];
-        }
-        
-        console.log(`Jugador ${playerName} reconectado a sala ${roomId}`);
+        console.log(`Jugador ${playerName} reconectado a sala ${roomId} (fase: ${currentPhase})`);
         io.to(roomId).emit('roomUpdate', room);
         io.to(roomId).emit('playerReconnected', { playerName });
         return;
@@ -371,6 +400,7 @@ io.on('connection', (socket) => {
       // Verificar si ya hay un líder designado (por el Diplomático)
       if (room.leader) {
         // Saltar votación y pasar directo a WordGuess
+        setRoomPhase(roomId, 'wordGuess');
         io.to(roomId).emit('wordGuessStart', { leaderId: room.leader });
         
         // Si el líder designado es un bot, adivina automáticamente
@@ -399,6 +429,7 @@ io.on('connection', (socket) => {
         }
       } else {
         // Flujo normal: Votación de líder
+        setRoomPhase(roomId, 'leaderVote');
         io.to(roomId).emit('leaderVoteStart');
 
         // Bots votan automáticamente después de un delay
@@ -427,6 +458,7 @@ io.on('connection', (socket) => {
 
     // 1. Ganan los buenos: Todos los malvados muertos
     if (malvados.length === 0) {
+      setRoomPhase(roomId, 'gameOver');
       io.to(roomId).emit('gameOver', {
         winner: 'PUEBLO',
         reason: 'Todos los malvados han sido eliminados.',
@@ -438,6 +470,7 @@ io.on('connection', (socket) => {
 
     // 2. Ganan los malvados: Igual o más malvados que buenos
     if (malvados.length >= buenos.length) {
+      setRoomPhase(roomId, 'gameOver');
       io.to(roomId).emit('gameOver', {
         winner: 'MALVADOS',
         reason: 'Los malvados han igualado o superado en número a los inocentes.',
@@ -548,6 +581,7 @@ io.on('connection', (socket) => {
     if (room && room.host === socket.id && room.leaderVoteResult) {
       if (room.leaderVoteResult.tie) {
         if (action === 'night') {
+          setRoomPhase(roomId, 'night');
           io.to(roomId).emit('nightPhaseStart');
           handleBotNightActions(roomId);
         } else {
@@ -555,6 +589,7 @@ io.on('connection', (socket) => {
         }
       } else {
         const leaderId = room.leaderVoteResult.winner.id;
+        setRoomPhase(roomId, 'wordGuess');
         io.to(roomId).emit('wordGuessStart', { leaderId });
 
         // Si el líder es un bot, adivina automáticamente la palabra correcta
@@ -580,6 +615,7 @@ io.on('connection', (socket) => {
     const room = rooms[roomId];
     if (!room) return;
     
+    setRoomPhase(roomId, 'eliminationVote');
     io.to(roomId).emit('eliminationVoteStart');
 
     // Bots votan automáticamente
@@ -694,6 +730,7 @@ io.on('connection', (socket) => {
   socket.on('proceedAfterEliminationVote', ({ roomId }) => {
     const room = rooms[roomId];
     if (room && room.host === socket.id) {
+      setRoomPhase(roomId, 'night');
       io.to(roomId).emit('nightPhaseStart');
       handleBotNightActions(roomId);
     }
@@ -714,6 +751,7 @@ io.on('connection', (socket) => {
       // Verificar victoria del Asesino
       const leader = room.players.find(p => p.id === socket.id);
       if (isCorrect && leader && leader.role === ROLES.ASESINO) {
+         setRoomPhase(roomId, 'gameOver');
          io.to(roomId).emit('gameOver', { 
             winner: 'MALVADOS', 
             reason: 'El Asesino ha sido elegido Líder y ha acertado la palabra secreta.',
@@ -766,6 +804,7 @@ io.on('connection', (socket) => {
           startEliminationVote(roomId);
        } else {
           // Night gana o empate
+          setRoomPhase(roomId, 'night');
           io.to(roomId).emit('nightPhaseStart');
           handleBotNightActions(roomId);
        }
@@ -792,6 +831,7 @@ io.on('connection', (socket) => {
   socket.on('proceedToNightFromWordGuess', ({ roomId }) => {
     const room = rooms[roomId];
     if (room && room.host === socket.id) {
+      setRoomPhase(roomId, 'night');
       io.to(roomId).emit('nightPhaseStart');
       handleBotNightActions(roomId);
     }
@@ -812,6 +852,7 @@ io.on('connection', (socket) => {
       const readyCount = room.players.filter(p => p.ready).length;
       io.to(roomId).emit('readyUpdate', { ready: readyCount, total: room.players.length });
       if (readyCount === room.players.length) {
+        setRoomPhase(roomId, 'day');
         io.to(roomId).emit('dayPhaseStart');
       }
     }
@@ -1299,6 +1340,7 @@ io.on('connection', (socket) => {
     room.sabotagedPlayerIds = [];
 
     // Navegar a RoleRevealPhase en lugar de DayPhase directo
+    setRoomPhase(roomId, 'roleReveal');
     io.to(roomId).emit('gameStart', { day: room.day }); 
   };
 
