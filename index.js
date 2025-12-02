@@ -90,12 +90,165 @@ const io = new Server(server, {
 // Estructura de salas: { [roomId]: { players: [{ id: socketId, name }], host: socketId } }
 const rooms = {};
 
+// Mapa de reconexión: { playerId: { roomId, playerData, disconnectTime } }
+const disconnectedPlayers = {};
+
+// Tiempo máximo para reconectar (30 segundos)
+const RECONNECT_TIMEOUT = 30000;
+
 io.on('connection', (socket) => {
+  console.log(`Socket conectado: ${socket.id}`);
+
+  // Intentar reconexión
+  socket.on('attemptReconnect', ({ playerId, playerName, roomId }, callback) => {
+    console.log(`Intento de reconexión: playerId=${playerId}, playerName=${playerName}, roomId=${roomId}`);
+    
+    const disconnectedInfo = disconnectedPlayers[playerId];
+    const room = rooms[roomId];
+
+    if (!room) {
+      console.log('Sala no encontrada:', roomId);
+      return callback({ success: false, error: 'Sala no encontrada' });
+    }
+
+    // Estrategia de búsqueda:
+    // 1. Buscar por playerName (más confiable en caso de F5)
+    // 2. Buscar por playerId (para reconexiones normales)
+    let playerIndex = -1;
+    
+    if (playerName) {
+      console.log('Buscando por nombre:', playerName);
+      playerIndex = room.players.findIndex(p => p.name === playerName);
+    }
+    
+    if (playerIndex === -1 && playerId) {
+      console.log('Buscando por ID:', playerId);
+      playerIndex = room.players.findIndex(p => p.id === playerId);
+    }
+    
+    if (playerIndex === -1) {
+      console.log('Jugador no encontrado en la sala. Jugadores en sala:', room.players.map(p => ({ id: p.id, name: p.name })));
+      return callback({ success: false, error: 'Jugador no encontrado en la sala' });
+    }
+
+    // Actualizar el socket ID del jugador
+    const player = room.players[playerIndex];
+    const oldSocketId = player.id;
+    console.log(`Actualizando jugador ${player.name}: ${oldSocketId} -> ${socket.id}`);
+    
+    player.id = socket.id;
+    player.connected = true;
+    
+    // Si era el host, actualizar
+    if (room.host === oldSocketId) {
+      room.host = socket.id;
+      console.log('Host actualizado');
+    }
+
+    // Si era el líder actual, actualizar
+    if (room.leader === oldSocketId) {
+      room.leader = socket.id;
+      console.log('Líder actualizado:', oldSocketId, '->', socket.id);
+    }
+
+    // Actualizar referencias en fragments si existen
+    if (room.fragments && room.fragments[oldSocketId] !== undefined) {
+      room.fragments[socket.id] = room.fragments[oldSocketId];
+      delete room.fragments[oldSocketId];
+    }
+    
+    // Actualizar referencias en abilityUsages si existen
+    if (room.abilityUsages && room.abilityUsages[oldSocketId] !== undefined) {
+      room.abilityUsages[socket.id] = room.abilityUsages[oldSocketId];
+      delete room.abilityUsages[oldSocketId];
+    }
+
+    // Actualizar referencias en nextPhaseVotes si existen
+    if (room.nextPhaseVotes && room.nextPhaseVotes[oldSocketId] !== undefined) {
+      room.nextPhaseVotes[socket.id] = room.nextPhaseVotes[oldSocketId];
+      delete room.nextPhaseVotes[oldSocketId];
+    }
+
+    // Actualizar referencias en nightActions si existen
+    if (room.nightActions && room.nightActions[oldSocketId] !== undefined) {
+      room.nightActions[socket.id] = room.nightActions[oldSocketId];
+      delete room.nightActions[oldSocketId];
+    }
+
+    // Actualizar referencias en nightSummaryReady (Set) si existen
+    if (room.nightSummaryReady && room.nightSummaryReady.has(oldSocketId)) {
+      room.nightSummaryReady.delete(oldSocketId);
+      room.nightSummaryReady.add(socket.id);
+      console.log('nightSummaryReady actualizado para reconexión');
+    }
+
+    // Actualizar referencias en nightActionDone si existen
+    if (room.nightActionDone) {
+      if (room.nightActionDone instanceof Set) {
+        if (room.nightActionDone.has(oldSocketId)) {
+          room.nightActionDone.delete(oldSocketId);
+          room.nightActionDone.add(socket.id);
+        }
+      } else if (room.nightActionDone[oldSocketId] !== undefined) {
+        room.nightActionDone[socket.id] = room.nightActionDone[oldSocketId];
+        delete room.nightActionDone[oldSocketId];
+      }
+    }
+
+    // Actualizar referencias en nightReady (Set usado por nightActionDone) si existen
+    if (room.nightReady && room.nightReady.has(oldSocketId)) {
+      room.nightReady.delete(oldSocketId);
+      room.nightReady.add(socket.id);
+      console.log('nightReady actualizado para reconexión');
+    }
+
+    // Actualizar referencias en leaderVotes si existen
+    if (room.leaderVotes && room.leaderVotes[oldSocketId] !== undefined) {
+      room.leaderVotes[socket.id] = room.leaderVotes[oldSocketId];
+      delete room.leaderVotes[oldSocketId];
+      console.log('leaderVotes actualizado para reconexión');
+    }
+
+    // Unir al socket a la sala
+    socket.join(roomId);
+
+    // Limpiar de desconectados
+    if (disconnectedInfo) {
+      delete disconnectedPlayers[playerId];
+    }
+
+    console.log(`Reconexión exitosa: ${player.name} (${oldSocketId} -> ${socket.id})`);
+    console.log(`Fase actual: ${room.currentPhase || 'lobby'}`);
+
+    // Enviar estado completo del juego
+    const response = {
+      success: true,
+      roomData: room,
+      playerData: player,
+      currentPhase: room.currentPhase || 'lobby',
+      fragment: room.fragments ? room.fragments[socket.id] : null,
+      role: player.role || null,
+      roomId: roomId,
+      leaderId: room.leader || null, // Enviar el líder actual si existe
+      wordGuessResult: room.wordGuessResult || null, // Enviar resultado de word-guess si existe
+      hasVotedNextPhase: room.nextPhaseVotes && room.nextPhaseVotes[oldSocketId] !== undefined // Si ya votó en next phase
+    };
+    
+    callback(response);
+
+    // Notificar a todos
+    io.to(roomId).emit('roomUpdate', room);
+    io.to(roomId).emit('playerReconnected', { playerId: socket.id, name: player.name });
+  });
 
   // Crear sala
   socket.on('createRoom', (callback) => {
     const roomId = Math.random().toString(36).substr(2, 4).toUpperCase();
-    rooms[roomId] = { players: [{ id: socket.id, name: null }], host: socket.id };
+    rooms[roomId] = { 
+      players: [{ id: socket.id, name: null, connected: true }], 
+      host: socket.id,
+      createdAt: Date.now()
+    };
     socket.join(roomId);
     callback({ roomId });
     io.to(roomId).emit('roomUpdate', rooms[roomId]);
@@ -104,7 +257,7 @@ io.on('connection', (socket) => {
   // Unirse a sala
   socket.on('joinRoom', (roomId, callback) => {
     if (rooms[roomId]) {
-      rooms[roomId].players.push({ id: socket.id, name: null });
+      rooms[roomId].players.push({ id: socket.id, name: null, connected: true });
       socket.join(roomId);
       callback({ success: true });
       io.to(roomId).emit('roomUpdate', rooms[roomId]);
@@ -195,17 +348,21 @@ io.on('connection', (socket) => {
     room.abilityUsages = {};
     room.assassinSkippedCount = 0;
     room.saboteurRecruited = false;
+    room.currentPhase = 'role-reveal'; // Establecer fase actual
 
     // Enviar rol y fragmento a cada jugador
     players.forEach((player) => {
       if (player.isBot) {
         player.ready = true; // Bots listos automáticamente
       } else {
+        // El Asesino recibe la palabra secreta completa, no un fragmento
+        const fragmentToSend = player.role === 'ASESINO' ? keyword : (fragments[player.id] || null);
+        console.log(`Sending role to ${player.name} (${player.role}): fragment=${fragmentToSend}`);
         io.to(player.id).emit('roleAssigned', { 
           role: player.role, 
           name: player.name, 
           roomId,
-          fragment: fragments[player.id] || null
+          fragment: fragmentToSend
         });
       }
     });
@@ -218,6 +375,67 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Solicitar estado de word-guess (para reconexión)
+  socket.on('requestWordGuessState', ({ roomId }) => {
+    const room = rooms[roomId];
+    if (room && room.currentPhase === 'word-guess') {
+      const response = {
+        leaderId: room.leader,
+        isLeader: room.leader === socket.id, // Indicar si este socket es el líder
+        result: room.wordGuessResult || null,
+        hasVotedNextPhase: room.nextPhaseVotes && room.nextPhaseVotes[socket.id] !== undefined
+      };
+      console.log('Enviando estado de word-guess:', { 
+        socketId: socket.id, 
+        leaderId: room.leader, 
+        isLeader: response.isLeader,
+        hasResult: !!response.result,
+        resultContent: response.result // Log completo del resultado
+      });
+      socket.emit('wordGuessStateUpdate', response);
+    }
+  });
+
+  // Solicitar estado de night-phase (para reconexión)
+  socket.on('requestNightPhaseState', ({ roomId }) => {
+    const room = rooms[roomId];
+    if (room && room.currentPhase === 'night-phase') {
+      // Verificar si ya realizó acción nocturna
+      const hasActed = room.nightActions && room.nightActions[socket.id] !== undefined;
+      
+      // Verificar si ya confirmó el resumen (nightSummaryReady es un Set)
+      const summaryConfirmed = room.nightSummaryReady && room.nightSummaryReady.has(socket.id);
+      
+      // Verificar si ya hizo clic en continuar (nightReady es un Set)
+      const isReadyToAdvance = room.nightReady && room.nightReady.has(socket.id);
+      
+      const response = {
+        hasActed,
+        nightResults: room.nightResults || null,
+        summaryConfirmed: summaryConfirmed || false,
+        isReadyToAdvance: isReadyToAdvance || false
+      };
+      console.log('Enviando estado de night-phase:', response);
+      socket.emit('nightPhaseStateUpdate', response);
+    }
+  });
+
+  // Solicitar estado de leader-vote (para reconexión)
+  socket.on('requestLeaderVoteState', ({ roomId }) => {
+    const room = rooms[roomId];
+    if (room && room.currentPhase === 'leader-vote') {
+      // Verificar si ya votó
+      const hasVoted = room.leaderVotes && room.leaderVotes[socket.id] && room.leaderVotes[socket.id].length > 0;
+      
+      const response = {
+        hasVoted: hasVoted || false,
+        voteResult: room.leaderVoteResult || null
+      };
+      console.log('Enviando estado de leader-vote:', response);
+      socket.emit('leaderVoteStateUpdate', response);
+    }
+  });
+
   // Terminar fase de día (solo host)
   socket.on('endDayPhase', ({ roomId }) => {
     const room = rooms[roomId];
@@ -225,6 +443,7 @@ io.on('connection', (socket) => {
       // Verificar si ya hay un líder designado (por el Diplomático)
       if (room.leader) {
         // Saltar votación y pasar directo a WordGuess
+        room.currentPhase = 'word-guess'; // Actualizar fase
         io.to(roomId).emit('wordGuessStart', { leaderId: room.leader });
         
         // Si el líder designado es un bot, adivina automáticamente
@@ -235,13 +454,25 @@ io.on('connection', (socket) => {
             room.wordGuessResult = {
               word,
               isCorrect: true,
-              leaderId: leader.id
+              leaderId: leader.id,
+              correctWord: room.keyword
             };
             io.to(roomId).emit('wordGuessResult', room.wordGuessResult);
+
+            // Inicializar votación de siguiente fase (para bots auto-guess)
+            room.nextPhaseVotes = {};
+            setTimeout(() => {
+               const bots = room.players.filter(p => p.isBot);
+               bots.forEach(bot => {
+                  const choice = Math.random() > 0.5 ? 'elimination' : 'night';
+                  handleNextPhaseVote(roomId, bot.id, choice);
+               });
+            }, 2000);
           }, 3000);
         }
       } else {
         // Flujo normal: Votación de líder
+        room.currentPhase = 'leader-vote'; // Actualizar fase
         io.to(roomId).emit('leaderVoteStart');
 
         // Bots votan automáticamente después de un delay
@@ -270,6 +501,7 @@ io.on('connection', (socket) => {
 
     // 1. Ganan los buenos: Todos los malvados muertos
     if (malvados.length === 0) {
+      room.currentPhase = 'game-over'; // Actualizar fase
       io.to(roomId).emit('gameOver', {
         winner: 'PUEBLO',
         reason: 'Todos los malvados han sido eliminados.',
@@ -281,6 +513,7 @@ io.on('connection', (socket) => {
 
     // 2. Ganan los malvados: Igual o más malvados que buenos
     if (malvados.length >= buenos.length) {
+      room.currentPhase = 'game-over'; // Actualizar fase
       io.to(roomId).emit('gameOver', {
         winner: 'MALVADOS',
         reason: 'Los malvados han igualado o superado en número a los inocentes.',
@@ -370,6 +603,18 @@ io.on('connection', (socket) => {
 
       // Emitir resultado a todos
       io.to(roomId).emit('leaderVoteResult', result);
+
+      // Si hay empate, iniciar votación de desempate (siguiente fase)
+      if (isTie) {
+         room.nextPhaseVotes = {};
+         setTimeout(() => {
+            const bots = room.players.filter(p => p.isBot);
+            bots.forEach(bot => {
+               const choice = Math.random() > 0.5 ? 'elimination' : 'night';
+               handleNextPhaseVote(roomId, bot.id, choice);
+            });
+         }, 2000);
+      }
     }
   };
 
@@ -379,6 +624,7 @@ io.on('connection', (socket) => {
     if (room && room.host === socket.id && room.leaderVoteResult) {
       if (room.leaderVoteResult.tie) {
         if (action === 'night') {
+          room.currentPhase = 'night-phase'; // Actualizar fase
           io.to(roomId).emit('nightPhaseStart');
           handleBotNightActions(roomId);
         } else {
@@ -386,6 +632,7 @@ io.on('connection', (socket) => {
         }
       } else {
         const leaderId = room.leaderVoteResult.winner.id;
+        room.currentPhase = 'word-guess'; // Actualizar fase
         io.to(roomId).emit('wordGuessStart', { leaderId });
 
         // Si el líder es un bot, adivina automáticamente la palabra correcta
@@ -396,7 +643,8 @@ io.on('connection', (socket) => {
             room.wordGuessResult = {
               word,
               isCorrect: true,
-              leaderId: leader.id
+              leaderId: leader.id,
+              correctWord: room.keyword
             };
             io.to(roomId).emit('wordGuessResult', room.wordGuessResult);
           }, 3000);
@@ -410,6 +658,7 @@ io.on('connection', (socket) => {
     const room = rooms[roomId];
     if (!room) return;
     
+    room.currentPhase = 'elimination-vote'; // Actualizar fase
     io.to(roomId).emit('eliminationVoteStart');
 
     // Bots votan automáticamente
@@ -508,7 +757,7 @@ io.on('connection', (socket) => {
       room.eliminationVoteResult = result;
       io.to(roomId).emit('eliminationVoteResult', result);
 
-      // Verificar fin del juego tras eliminación
+      // Verificar fin del juego tras la eliminación
       if (eliminated) {
          checkGameOver(roomId);
       }
@@ -524,6 +773,7 @@ io.on('connection', (socket) => {
   socket.on('proceedAfterEliminationVote', ({ roomId }) => {
     const room = rooms[roomId];
     if (room && room.host === socket.id) {
+      room.currentPhase = 'night-phase'; // Actualizar fase
       io.to(roomId).emit('nightPhaseStart');
       handleBotNightActions(roomId);
     }
@@ -537,12 +787,16 @@ io.on('connection', (socket) => {
       room.wordGuessResult = {
         word,
         isCorrect,
-        leaderId: socket.id
+        leaderId: socket.id,
+        correctWord: room.keyword
       };
+      
+      console.log('Word guess result guardado:', room.wordGuessResult);
 
       // Verificar victoria del Asesino
       const leader = room.players.find(p => p.id === socket.id);
       if (isCorrect && leader && leader.role === ROLES.ASESINO) {
+         room.currentPhase = 'game-over'; // Actualizar fase
          io.to(roomId).emit('gameOver', { 
             winner: 'MALVADOS', 
             reason: 'El Asesino ha sido elegido Líder y ha acertado la palabra secreta.',
@@ -551,8 +805,62 @@ io.on('connection', (socket) => {
          });
       } else {
          io.to(roomId).emit('wordGuessResult', room.wordGuessResult);
+         
+         // Inicializar votación de siguiente fase
+         room.nextPhaseVotes = {};
+         
+         // Bots votan aleatoriamente tras un delay
+         setTimeout(() => {
+            const bots = room.players.filter(p => p.isBot);
+            bots.forEach(bot => {
+               const choice = Math.random() > 0.5 ? 'elimination' : 'night';
+               handleNextPhaseVote(roomId, bot.id, choice);
+            });
+         }, 2000);
       }
     }
+  });
+
+  const handleNextPhaseVote = (roomId, voterId, choice) => {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    if (!room.nextPhaseVotes) room.nextPhaseVotes = {};
+    
+    // Registrar voto (sobrescribe si ya votó, aunque el cliente lo bloquea)
+    room.nextPhaseVotes[voterId] = choice;
+
+    // Verificar si todos han votado (incluidos muertos/sombras)
+    const allPlayersCount = room.players.length;
+    const votesCount = Object.keys(room.nextPhaseVotes).length;
+
+    if (votesCount >= allPlayersCount) {
+       // Contar votos
+       let eliminationVotes = 0;
+       let nightVotes = 0;
+
+       Object.values(room.nextPhaseVotes).forEach(v => {
+          if (v === 'elimination') eliminationVotes++;
+          else if (v === 'night') nightVotes++;
+       });
+
+       // Decidir ganador (Empate -> Night)
+       if (eliminationVotes > nightVotes) {
+          startEliminationVote(roomId);
+       } else {
+          // Night gana o empate
+          io.to(roomId).emit('nightPhaseStart');
+          handleBotNightActions(roomId);
+       }
+    }
+  };
+
+  socket.on('voteNextPhase', ({ roomId, choice }) => {
+     handleNextPhaseVote(roomId, socket.id, choice);
+  });
+
+  socket.on('voteNextPhaseFromLeaderTie', ({ roomId, choice }) => {
+     handleNextPhaseVote(roomId, socket.id, choice);
   });
 
   // Host avanza desde WordGuess a Elimination
@@ -587,6 +895,7 @@ io.on('connection', (socket) => {
       const readyCount = room.players.filter(p => p.ready).length;
       io.to(roomId).emit('readyUpdate', { ready: readyCount, total: room.players.length });
       if (readyCount === room.players.length) {
+        room.currentPhase = 'day-phase'; // Actualizar fase
         io.to(roomId).emit('dayPhaseStart');
       }
     }
@@ -1046,7 +1355,10 @@ io.on('connection', (socket) => {
       let isSabotaged = false;
       let foundSecretWord = false;
       
-      if (room.sabotagedPlayerIds && room.sabotagedPlayerIds.includes(player.id)) {
+      // El Asesino recibe la palabra secreta completa
+      if (player.role === 'ASESINO') {
+         fragmentToSend = room.keyword;
+      } else if (room.sabotagedPlayerIds && room.sabotagedPlayerIds.includes(player.id)) {
          fragmentToSend = null;
          isSabotaged = true;
       } else if (videnteFoundWord && player.id === videnteId) {
@@ -1107,6 +1419,81 @@ io.on('connection', (socket) => {
         io.to(socket.id).emit('chatMessage', { ...msgData, recipientId }); // To sender
       } else {
         io.to(roomId).emit('chatMessage', msgData);
+      }
+    }
+  });
+  
+  // Manejar desconexión
+  socket.on('disconnect', () => {
+    console.log(`Socket desconectado: ${socket.id}`);
+    
+    // Buscar en qué sala estaba
+    for (const roomId in rooms) {
+      const room = rooms[roomId];
+      const playerIndex = room.players.findIndex(p => p.id === socket.id);
+      
+      if (playerIndex !== -1) {
+        const player = room.players[playerIndex];
+        console.log(`Jugador ${player.name} (${socket.id}) desconectado de sala ${roomId}`);
+        
+        // Marcar como desconectado temporalmente
+        player.connected = false;
+        
+        // Guardar info para posible reconexión
+        const playerId = socket.id;
+        disconnectedPlayers[playerId] = {
+          roomId,
+          playerData: { ...player },
+          disconnectTime: Date.now()
+        };
+        
+        // Notificar a otros jugadores
+        io.to(roomId).emit('playerDisconnected', { 
+          playerId: socket.id, 
+          name: player.name 
+        });
+        
+        io.to(roomId).emit('roomUpdate', room);
+        
+        // Programar eliminación si no reconecta
+        setTimeout(() => {
+          if (disconnectedPlayers[playerId]) {
+            console.log(`Timeout de reconexión para ${player.name}`);
+            
+            // Verificar si la sala y el jugador aún existen
+            const currentRoom = rooms[roomId];
+            if (currentRoom) {
+              const currentPlayerIndex = currentRoom.players.findIndex(p => p.id === playerId);
+              
+              if (currentPlayerIndex !== -1 && !currentRoom.players[currentPlayerIndex].connected) {
+                // Remover jugador definitivamente
+                currentRoom.players.splice(currentPlayerIndex, 1);
+                
+                // Si era el host, asignar nuevo host
+                if (currentRoom.host === playerId && currentRoom.players.length > 0) {
+                  currentRoom.host = currentRoom.players[0].id;
+                  console.log(`Nuevo host asignado: ${currentRoom.players[0].name}`);
+                }
+                
+                // Si no quedan jugadores, eliminar sala
+                if (currentRoom.players.length === 0) {
+                  console.log(`Sala ${roomId} eliminada (sin jugadores)`);
+                  delete rooms[roomId];
+                } else {
+                  io.to(roomId).emit('roomUpdate', currentRoom);
+                  io.to(roomId).emit('playerRemovedByTimeout', { 
+                    playerId, 
+                    name: player.name 
+                  });
+                }
+              }
+            }
+            
+            delete disconnectedPlayers[playerId];
+          }
+        }, RECONNECT_TIMEOUT);
+        
+        break;
       }
     }
   });

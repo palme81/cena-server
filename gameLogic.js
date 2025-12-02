@@ -400,8 +400,8 @@ const generateFragments = (keyword, players) => {
   
   players.forEach(player => {
     if (player.role === ROLES.ASESINO && player.isAlive) {
-      // El asesino vivo no recibe fragmento
-      fragments[player.id] = null;
+      // El asesino vivo recibe la palabra secreta
+      fragments[player.id] = keyword;
     } else {
       // Los demás reciben fragmentos aleatorios
       if (availableFragments.length > 0) {
