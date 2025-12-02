@@ -90,7 +90,87 @@ const io = new Server(server, {
 // Estructura de salas: { [roomId]: { players: [{ id: socketId, name }], host: socketId } }
 const rooms = {};
 
+// Mapa para reconexión: { odosocketId guardado -> { roomId, playerId (nombre), playerData } }
+const disconnectedPlayers = {};
+
+// Tiempo de gracia para reconexión (30 segundos)
+const RECONNECT_TIMEOUT = 30000;
+
 io.on('connection', (socket) => {
+
+  // Intentar reconectar jugador
+  socket.on('attemptReconnect', ({ roomId, playerName }, callback) => {
+    const room = rooms[roomId];
+    if (!room) {
+      callback({ success: false, error: 'Sala no encontrada' });
+      return;
+    }
+
+    // Buscar jugador desconectado con ese nombre en esa sala
+    const disconnectKey = `${roomId}_${playerName}`;
+    const disconnectedData = disconnectedPlayers[disconnectKey];
+    
+    if (disconnectedData) {
+      // Reconectar: actualizar el socket ID del jugador
+      const player = room.players.find(p => p.name === playerName);
+      if (player) {
+        const oldSocketId = player.id;
+        player.id = socket.id;
+        player.disconnected = false;
+        
+        // Limpiar timeout de eliminación
+        if (disconnectedData.timeout) {
+          clearTimeout(disconnectedData.timeout);
+        }
+        delete disconnectedPlayers[disconnectKey];
+        
+        // Unirse a la sala
+        socket.join(roomId);
+        
+        // Enviar estado actual al jugador reconectado
+        callback({ 
+          success: true, 
+          reconnected: true,
+          playerData: {
+            role: player.role,
+            name: player.name,
+            roomId: roomId,
+            fragment: room.fragments ? room.fragments[socket.id] || room.fragments[oldSocketId] : null,
+            isHost: room.host === oldSocketId
+          },
+          roomState: {
+            phase: room.phase || 'lobby',
+            day: room.day || 1
+          }
+        });
+        
+        // Si era el host, transferir
+        if (room.host === oldSocketId) {
+          room.host = socket.id;
+        }
+        
+        // Actualizar fragmentos con nuevo socket ID
+        if (room.fragments && room.fragments[oldSocketId]) {
+          room.fragments[socket.id] = room.fragments[oldSocketId];
+          delete room.fragments[oldSocketId];
+        }
+        
+        console.log(`Jugador ${playerName} reconectado a sala ${roomId}`);
+        io.to(roomId).emit('roomUpdate', room);
+        io.to(roomId).emit('playerReconnected', { playerName });
+        return;
+      }
+    }
+    
+    // No encontrado como desconectado, verificar si ya existe en la sala
+    const existingPlayer = room.players.find(p => p.name === playerName && !p.disconnected);
+    if (existingPlayer) {
+      callback({ success: false, error: 'Ya hay un jugador con ese nombre' });
+      return;
+    }
+    
+    callback({ success: false, error: 'No se encontró sesión para reconectar' });
+  });
 
   // Crear sala
   socket.on('createRoom', (callback) => {
@@ -126,6 +206,71 @@ io.on('connection', (socket) => {
   });
 
   // Salir de sala/desconexión
+  socket.on('disconnect', () => {
+    console.log(`Socket desconectado: ${socket.id}`);
+    
+    // Buscar en qué sala estaba este jugador
+    for (const roomId in rooms) {
+      const room = rooms[roomId];
+      const playerIndex = room.players.findIndex(p => p.id === socket.id);
+      
+      if (playerIndex !== -1) {
+        const player = room.players[playerIndex];
+        
+        // Si el juego ya comenzó, marcar como desconectado pero no eliminar
+        if (room.phase && room.phase !== 'lobby') {
+          player.disconnected = true;
+          const disconnectKey = `${roomId}_${player.name}`;
+          
+          console.log(`Jugador ${player.name} desconectado de sala ${roomId} (en juego). Esperando reconexión...`);
+          
+          // Guardar datos para reconexión
+          disconnectedPlayers[disconnectKey] = {
+            roomId,
+            playerName: player.name,
+            playerData: { ...player },
+            timeout: setTimeout(() => {
+              // Si no reconecta en el tiempo de gracia, eliminar
+              console.log(`Timeout de reconexión para ${player.name} en sala ${roomId}`);
+              const currentRoom = rooms[roomId];
+              if (currentRoom) {
+                const pIndex = currentRoom.players.findIndex(p => p.name === player.name);
+                if (pIndex !== -1 && currentRoom.players[pIndex].disconnected) {
+                  // Convertir en bot o eliminar
+                  currentRoom.players[pIndex].isBot = true;
+                  currentRoom.players[pIndex].disconnected = false;
+                  console.log(`Jugador ${player.name} convertido en bot`);
+                  io.to(roomId).emit('roomUpdate', currentRoom);
+                  io.to(roomId).emit('playerConvertedToBot', { playerName: player.name });
+                }
+              }
+              delete disconnectedPlayers[disconnectKey];
+            }, RECONNECT_TIMEOUT)
+          };
+          
+          io.to(roomId).emit('playerDisconnected', { playerName: player.name });
+          io.to(roomId).emit('roomUpdate', room);
+        } else {
+          // Si estamos en lobby, eliminar al jugador
+          room.players.splice(playerIndex, 1);
+          
+          // Si era el host y quedan jugadores, asignar nuevo host
+          if (room.host === socket.id && room.players.length > 0) {
+            room.host = room.players[0].id;
+          }
+          
+          // Si no quedan jugadores, eliminar sala
+          if (room.players.length === 0) {
+            delete rooms[roomId];
+            console.log(`Sala ${roomId} eliminada (sin jugadores)`);
+          } else {
+            io.to(roomId).emit('roomUpdate', room);
+          }
+        }
+        break;
+      }
+    }
+  });
   
       // Expulsar jugador (solo host)
   socket.on('kickPlayer', ({ roomId, playerId }) => {
