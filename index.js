@@ -105,6 +105,12 @@ const setRoomPhase = (roomId, phase) => {
 };
 
 io.on('connection', (socket) => {
+  // Obtener deviceId del handshake (enviado por el cliente)
+  const deviceId = socket.handshake.auth.deviceId || socket.id;
+  socket.deviceId = deviceId; // Guardar en el socket para referencia
+  socket.join(deviceId); // Unirse a una sala con su propio ID persistente
+  
+  console.log(`Socket conectado: ${socket.id} (Device: ${deviceId})`);
 
   // Intentar reconectar jugador
   socket.on('attemptReconnect', ({ roomId, playerName }, callback) => {
@@ -114,17 +120,41 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Buscar jugador desconectado con ese nombre en esa sala
+    // Buscar jugador por deviceId (prioridad) o por nombre (fallback)
+    let player = room.players.find(p => p.id === deviceId);
+    
+    // Si no se encuentra por ID, buscar por nombre (para compatibilidad o casos raros)
+    if (!player && playerName) {
+      player = room.players.find(p => p.name === playerName);
+    }
+    
+    // Buscar también en desconectados si no está en la lista activa
     const disconnectKey = `${roomId}_${playerName}`;
     const disconnectedData = disconnectedPlayers[disconnectKey];
     
-    // También buscar si el jugador existe en la sala (puede que no esté marcado como desconectado aún)
-    let player = room.players.find(p => p.name === playerName);
-    
-    if (disconnectedData || player) {
+    if (player || disconnectedData) {
+      if (disconnectedData && !player) {
+        // Restaurar desde desconectados si es necesario
+        // (Aunque con deviceId persistente, es probable que siga en players si no ha pasado el timeout)
+        // ... lógica de restauración si fuera necesaria ...
+      }
+
       if (player) {
-        const oldSocketId = player.id;
-        player.id = socket.id;
+        // Actualizar socketId actual
+        const oldSocketId = player.socketId || player.id; // fallback para compatibilidad
+        player.socketId = socket.id;
+        // Asegurar que el ID sea el deviceId persistente
+        if (player.id !== deviceId) {
+            console.log(`Actualizando ID de jugador de ${player.id} a ${deviceId}`);
+            // Si cambiamos el ID, hay que actualizar referencias (host, fragmentos, etc)
+            if (room.host === player.id) room.host = deviceId;
+            if (room.fragments && room.fragments[player.id]) {
+                room.fragments[deviceId] = room.fragments[player.id];
+                delete room.fragments[player.id];
+            }
+            player.id = deviceId;
+        }
+        
         player.disconnected = false;
         
         // Limpiar timeout de eliminación si existe
@@ -150,13 +180,7 @@ io.on('connection', (socket) => {
         };
         
         // Obtener el fragmento correcto
-        const fragment = room.fragments ? (room.fragments[socket.id] || room.fragments[oldSocketId]) : null;
-        
-        // Actualizar fragmentos con nuevo socket ID
-        if (room.fragments && room.fragments[oldSocketId] && oldSocketId !== socket.id) {
-          room.fragments[socket.id] = room.fragments[oldSocketId];
-          delete room.fragments[oldSocketId];
-        }
+        const fragment = room.fragments ? room.fragments[player.id] : null;
         
         // Enviar estado actual al jugador reconectado
         callback({ 
@@ -167,7 +191,7 @@ io.on('connection', (socket) => {
             name: player.name,
             roomId: roomId,
             fragment: fragment,
-            isHost: room.host === oldSocketId || room.host === socket.id,
+            isHost: room.host === player.id,
             isAlive: player.isAlive
           },
           roomState: {
@@ -175,33 +199,19 @@ io.on('connection', (socket) => {
             navigateTo: phaseMap[currentPhase] || '/day-phase',
             day: room.day || 1,
             leader: room.leader,
-            keyword: player.role === 'ASESINO' ? room.keyword : null,
-            players: room.players,
-            votes: room.votes || {},
-            sabotages: room.sabotages || [],
-            isSabotaged: room.isSabotaged || false,
-            foundSecretWord: room.foundSecretWord || false,
-            fragments: room.fragments || {}, // Fragmentos públicos si los hubiera
-            winner: room.winner || null,
-            winningTeam: room.winningTeam || null,
-            deadPlayers: room.deadPlayers || []
+            keyword: player.role === 'ASESINO' ? room.keyword : null
           }
         });
         
-        // Si era el host, transferir
-        if (room.host === oldSocketId) {
-          room.host = socket.id;
-        }
-        
-        console.log(`Jugador ${playerName} reconectado a sala ${roomId} (fase: ${currentPhase})`);
+        console.log(`Jugador ${player.name} (Dev: ${deviceId}) reconectado a sala ${roomId}`);
         io.to(roomId).emit('roomUpdate', room);
-        io.to(roomId).emit('playerReconnected', { playerName });
+        io.to(roomId).emit('playerReconnected', { playerName: player.name });
         return;
       }
     }
     
     // No encontrado como desconectado, verificar si ya existe en la sala
-    const existingPlayer = room.players.find(p => p.name === playerName && !p.disconnected);
+    const existingPlayer = room.players.find(p => p.name === playerName && !p.disconnected && p.id !== deviceId);
     if (existingPlayer) {
       callback({ success: false, error: 'Ya hay un jugador con ese nombre' });
       return;
@@ -213,7 +223,11 @@ io.on('connection', (socket) => {
   // Crear sala
   socket.on('createRoom', (callback) => {
     const roomId = Math.random().toString(36).substr(2, 4).toUpperCase();
-    rooms[roomId] = { players: [{ id: socket.id, name: null }], host: socket.id };
+    // Usar deviceId como ID del jugador
+    rooms[roomId] = { 
+      players: [{ id: deviceId, socketId: socket.id, name: null }], 
+      host: deviceId 
+    };
     socket.join(roomId);
     callback({ roomId });
     io.to(roomId).emit('roomUpdate', rooms[roomId]);
@@ -222,7 +236,16 @@ io.on('connection', (socket) => {
   // Unirse a sala
   socket.on('joinRoom', (roomId, callback) => {
     if (rooms[roomId]) {
-      rooms[roomId].players.push({ id: socket.id, name: null });
+      // Verificar si ya está en la sala
+      const existing = rooms[roomId].players.find(p => p.id === deviceId);
+      if (!existing) {
+        rooms[roomId].players.push({ id: deviceId, socketId: socket.id, name: null });
+      } else {
+        // Si ya existe, actualizar socketId
+        existing.socketId = socket.id;
+        existing.disconnected = false;
+      }
+      
       socket.join(roomId);
       callback({ success: true });
       io.to(roomId).emit('roomUpdate', rooms[roomId]);
@@ -234,7 +257,7 @@ io.on('connection', (socket) => {
   // Establecer nombre de jugador
   socket.on('setPlayerName', ({ roomId, name }) => {
     if (rooms[roomId]) {
-      const player = rooms[roomId].players.find(p => p.id === socket.id);
+      const player = rooms[roomId].players.find(p => p.id === deviceId);
       if (player) {
         player.name = name;
         player.ready = false; // inicializar flag de listo cuando pone nombre
@@ -245,12 +268,13 @@ io.on('connection', (socket) => {
 
   // Salir de sala/desconexión
   socket.on('disconnect', () => {
-    console.log(`Socket desconectado: ${socket.id}`);
+    console.log(`Socket desconectado: ${socket.id} (Dev: ${deviceId})`);
     
     // Buscar en qué sala estaba este jugador
     for (const roomId in rooms) {
       const room = rooms[roomId];
-      const playerIndex = room.players.findIndex(p => p.id === socket.id);
+      // Buscar por deviceId
+      const playerIndex = room.players.findIndex(p => p.id === deviceId);
       
       if (playerIndex !== -1) {
         const player = room.players[playerIndex];
@@ -272,7 +296,8 @@ io.on('connection', (socket) => {
               console.log(`Timeout de reconexión para ${player.name} en sala ${roomId}`);
               const currentRoom = rooms[roomId];
               if (currentRoom) {
-                const pIndex = currentRoom.players.findIndex(p => p.name === player.name);
+                // Buscar por deviceId
+                const pIndex = currentRoom.players.findIndex(p => p.id === deviceId);
                 if (pIndex !== -1 && currentRoom.players[pIndex].disconnected) {
                   // Convertir en bot o eliminar
                   currentRoom.players[pIndex].isBot = true;
@@ -293,7 +318,7 @@ io.on('connection', (socket) => {
           room.players.splice(playerIndex, 1);
           
           // Si era el host y quedan jugadores, asignar nuevo host
-          if (room.host === socket.id && room.players.length > 0) {
+          if (room.host === deviceId && room.players.length > 0) {
             room.host = room.players[0].id;
           }
           
@@ -313,21 +338,19 @@ io.on('connection', (socket) => {
       // Expulsar jugador (solo host)
   socket.on('kickPlayer', ({ roomId, playerId }) => {
     const room = rooms[roomId];
-    if (room && room.host === socket.id) {
+    // Verificar host usando deviceId
+    if (room && room.host === deviceId) {
       // Verificar que no se expulse a sí mismo
       if (playerId === room.host) return;
 
       // Filtrar jugador
       room.players = room.players.filter(p => p.id !== playerId);
       
-      // Notificar al jugador expulsado
+      // Notificar al jugador expulsado (usando su ID persistente que es una sala)
       io.to(playerId).emit('playerKicked');
       
-      // Hacer que el socket abandone la sala
-      const targetSocket = io.sockets.sockets.get(playerId);
-      if (targetSocket) {
-        targetSocket.leave(roomId);
-      }
+      // Hacer que todos los sockets de ese jugador abandonen la sala
+      io.in(playerId).socketsLeave(roomId);
 
       // Actualizar sala
       io.to(roomId).emit('roomUpdate', room);
@@ -405,7 +428,7 @@ io.on('connection', (socket) => {
   // Terminar fase de día (solo host)
   socket.on('endDayPhase', ({ roomId }) => {
     const room = rooms[roomId];
-    if (room && room.host === socket.id) {
+    if (room && room.host === socket.deviceId) {
       // Verificar si ya hay un líder designado (por el Diplomático)
       if (room.leader) {
         // Saltar votación y pasar directo a WordGuess
@@ -587,7 +610,7 @@ io.on('connection', (socket) => {
   // Host solicita avanzar tras ver resultados de votación líder
   socket.on('proceedAfterLeaderVote', ({ roomId, action }) => {
     const room = rooms[roomId];
-    if (room && room.host === socket.id && room.leaderVoteResult) {
+    if (room && room.host === socket.deviceId && room.leaderVoteResult) {
       if (room.leaderVoteResult.tie) {
         if (action === 'night') {
           setRoomPhase(roomId, 'night');
@@ -732,13 +755,13 @@ io.on('connection', (socket) => {
 
   // Votación de eliminación (cliente real)
   socket.on('submitEliminationVote', ({ roomId, candidateId }) => {
-    handleEliminationVote(roomId, socket.id, candidateId);
+    handleEliminationVote(roomId, socket.deviceId, candidateId);
   });
 
   // Host solicita avanzar tras ver resultados de eliminación
   socket.on('proceedAfterEliminationVote', ({ roomId }) => {
     const room = rooms[roomId];
-    if (room && room.host === socket.id) {
+    if (room && room.host === socket.deviceId) {
       setRoomPhase(roomId, 'night');
       io.to(roomId).emit('nightPhaseStart');
       handleBotNightActions(roomId);
@@ -753,12 +776,12 @@ io.on('connection', (socket) => {
       room.wordGuessResult = {
         word,
         isCorrect,
-        leaderId: socket.id,
+        leaderId: socket.deviceId,
         correctWord: room.keyword
       };
 
       // Verificar victoria del Asesino
-      const leader = room.players.find(p => p.id === socket.id);
+      const leader = room.players.find(p => p.id === socket.deviceId);
       if (isCorrect && leader && leader.role === ROLES.ASESINO) {
          setRoomPhase(roomId, 'gameOver');
          io.to(roomId).emit('gameOver', { 
@@ -821,17 +844,17 @@ io.on('connection', (socket) => {
   };
 
   socket.on('voteNextPhase', ({ roomId, choice }) => {
-     handleNextPhaseVote(roomId, socket.id, choice);
+     handleNextPhaseVote(roomId, socket.deviceId, choice);
   });
 
   socket.on('voteNextPhaseFromLeaderTie', ({ roomId, choice }) => {
-     handleNextPhaseVote(roomId, socket.id, choice);
+     handleNextPhaseVote(roomId, socket.deviceId, choice);
   });
 
   // Host avanza desde WordGuess a Elimination
   socket.on('proceedToElimination', ({ roomId }) => {
     const room = rooms[roomId];
-    if (room && room.host === socket.id) {
+    if (room && room.host === socket.deviceId) {
       startEliminationVote(roomId);
     }
   });
@@ -839,7 +862,7 @@ io.on('connection', (socket) => {
   // Host avanza desde WordGuess a Night (Fase de Sueños)
   socket.on('proceedToNightFromWordGuess', ({ roomId }) => {
     const room = rooms[roomId];
-    if (room && room.host === socket.id) {
+    if (room && room.host === socket.deviceId) {
       setRoomPhase(roomId, 'night');
       io.to(roomId).emit('nightPhaseStart');
       handleBotNightActions(roomId);
@@ -848,14 +871,14 @@ io.on('connection', (socket) => {
 
   // Votación de líder (cliente real)
   socket.on('submitLeaderVote', ({ roomId, candidateId }) => {
-    handleLeaderVote(roomId, socket.id, candidateId);
+    handleLeaderVote(roomId, socket.deviceId, candidateId);
   });
 
   // Jugador marca que ya vio su rol y está listo
   socket.on('playerReady', ({ roomId }) => {
     const room = rooms[roomId];
     if (!room) return;
-    const player = room.players.find(p => p.id === socket.id);
+    const player = room.players.find(p => p.id === socket.deviceId);
     if (player) {
       player.ready = true;
       const readyCount = room.players.filter(p => p.ready).length;
@@ -953,7 +976,7 @@ io.on('connection', (socket) => {
     if (!room.nightReady) {
       room.nightReady = new Set();
     }
-    room.nightReady.add(socket.id);
+    room.nightReady.add(socket.deviceId);
     
     checkNightPhaseCompletion(roomId);
   });
@@ -1150,19 +1173,19 @@ io.on('connection', (socket) => {
       room.nightActions = {};
     }
 
-    const player = room.players.find(p => p.id === socket.id);
+    const player = room.players.find(p => p.id === socket.deviceId);
     if (!player || !player.isAlive) return;
 
-    room.nightActions[socket.id] = { actionType, targetId, role: player.role };
+    room.nightActions[socket.deviceId] = { actionType, targetId, role: player.role };
 
     if (player.role === ROLES.DETECTIVE && targetId) {
       // Detective solo recibe feedback si fue líder y acertó la palabra
       const isDetectiveLeader = room.wordGuessResult && 
                                 room.wordGuessResult.isCorrect && 
-                                room.wordGuessResult.leaderId === socket.id;
+                                room.wordGuessResult.leaderId === socket.deviceId;
       
       // Verificar usos (máximo 1)
-      const uses = room.abilityUsages[socket.id] || 0;
+      const uses = room.abilityUsages[socket.deviceId] || 0;
 
       if (isDetectiveLeader) {
         if (uses < 1) {
@@ -1173,7 +1196,7 @@ io.on('connection', (socket) => {
             socket.emit('nightActionFeedback', { message: `${target.name} pertenece al bando: ${teamLabel}` });
             
             // Registrar uso
-            room.abilityUsages[socket.id] = uses + 1;
+            room.abilityUsages[socket.deviceId] = uses + 1;
           }
         } else {
           socket.emit('nightActionFeedback', { message: "Ya has usado tu habilidad de investigación en esta partida." });
@@ -1208,7 +1231,7 @@ io.on('connection', (socket) => {
     if (!room.nightSummaryReady) {
       room.nightSummaryReady = new Set();
     }
-    room.nightSummaryReady.add(socket.id);
+    room.nightSummaryReady.add(socket.deviceId);
 
     // Bots auto-ready
     room.players.filter(p => p.isBot).forEach(bot => room.nightSummaryReady.add(bot.id));
@@ -1357,7 +1380,7 @@ io.on('connection', (socket) => {
   socket.on('proceedToDay', ({ roomId }) => {
      // This is now handled by ackNightSummary, but if host forces it:
      const room = rooms[roomId];
-     if (room && room.host === socket.id) {
+     if (room && room.host === socket.deviceId) {
         proceedToDayLogic(roomId);
      }
   });
@@ -1366,21 +1389,21 @@ io.on('connection', (socket) => {
   socket.on('chatMessage', ({ roomId, message, recipientId }) => {
     const room = rooms[roomId];
     if (room) {
-      const player = room.players.find(p => p.id === socket.id);
+      const player = room.players.find(p => p.id === socket.deviceId);
       const senderName = player ? player.name : 'Desconocido';
       
       const msgData = { 
         sender: senderName, 
         message, 
         timestamp: new Date().toISOString(), 
-        senderId: socket.id,
+        senderId: socket.deviceId,
         isPrivate: !!recipientId
       };
 
       if (recipientId) {
         // Private message
-        io.to(recipientId).emit('chatMessage', msgData); // To recipient
-        io.to(socket.id).emit('chatMessage', { ...msgData, recipientId }); // To sender
+        io.to(recipientId).emit('chatMessage', msgData); // To recipient (deviceId room)
+        socket.emit('chatMessage', { ...msgData, recipientId }); // To sender (current socket)
       } else {
         io.to(roomId).emit('chatMessage', msgData);
       }
