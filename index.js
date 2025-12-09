@@ -90,7 +90,7 @@ const io = new Server(server, {
 // Estructura de salas: { [roomId]: { players: [{ id: socketId, name }], host: socketId } }
 const rooms = {};
 
-// Mapa para reconexión: { roomId_playerName -> { roomId, playerName, playerData, timeout } }
+// Mapa para reconexión: { odosocketId guardado -> { roomId, playerId (nombre), playerData } }
 const disconnectedPlayers = {};
 
 // Tiempo de gracia para reconexión (30 segundos)
@@ -101,43 +101,6 @@ const setRoomPhase = (roomId, phase) => {
   if (rooms[roomId]) {
     rooms[roomId].phase = phase;
     console.log(`Sala ${roomId} cambió a fase: ${phase}`);
-  }
-};
-
-// Helper para verificar si hay jugadores desconectados esperando reconexión
-const hasDisconnectedPlayers = (roomId) => {
-  const room = rooms[roomId];
-  if (!room) return false;
-  return room.players.some(p => p.disconnected === true);
-};
-
-// Helper para obtener lista de jugadores desconectados
-const getDisconnectedPlayers = (roomId) => {
-  const room = rooms[roomId];
-  if (!room) return [];
-  return room.players.filter(p => p.disconnected === true).map(p => ({
-    name: p.name,
-    disconnectedAt: p.disconnectedAt || Date.now()
-  }));
-};
-
-// Helper para notificar estado de espera a todos los jugadores
-const notifyWaitingState = (roomId) => {
-  const room = rooms[roomId];
-  if (!room) return;
-  
-  const disconnected = getDisconnectedPlayers(roomId);
-  if (disconnected.length > 0) {
-    io.to(roomId).emit('waitingForPlayers', {
-      disconnectedPlayers: disconnected,
-      timeout: RECONNECT_TIMEOUT,
-      isPaused: true
-    });
-  } else {
-    io.to(roomId).emit('waitingForPlayers', {
-      disconnectedPlayers: [],
-      isPaused: false
-    });
   }
 };
 
@@ -186,8 +149,14 @@ io.on('connection', (socket) => {
           'gameOver': '/multiplayer-game-over'
         };
         
-        // Obtener el fragmento correcto (ahora indexado por nombre)
-        const fragment = room.fragments ? room.fragments[player.name] : null;
+        // Obtener el fragmento correcto
+        const fragment = room.fragments ? (room.fragments[socket.id] || room.fragments[oldSocketId]) : null;
+        
+        // Actualizar fragmentos con nuevo socket ID
+        if (room.fragments && room.fragments[oldSocketId] && oldSocketId !== socket.id) {
+          room.fragments[socket.id] = room.fragments[oldSocketId];
+          delete room.fragments[oldSocketId];
+        }
         
         // Enviar estado actual al jugador reconectado
         callback({ 
@@ -199,34 +168,14 @@ io.on('connection', (socket) => {
             roomId: roomId,
             fragment: fragment,
             isHost: room.host === oldSocketId || room.host === socket.id,
-            isAlive: player.isAlive,
-            isSabotaged: room.sabotagedPlayerIds?.includes(player.id) || false
+            isAlive: player.isAlive
           },
           roomState: {
             phase: currentPhase,
             navigateTo: phaseMap[currentPhase] || '/day-phase',
             day: room.day || 1,
             leader: room.leader,
-            keyword: player.role === 'ASESINO' ? room.keyword : null,
-            // Estado de votaciones en curso
-            leaderVotes: room.leaderVotes || {},
-            eliminationVotes: room.eliminationVotes || {},
-            leaderVoteResult: room.leaderVoteResult,
-            eliminationVoteResult: room.eliminationVoteResult,
-            wordGuessResult: room.wordGuessResult,
-            nightResults: room.nightResults,
-            // Jugadores y sus estados
-            players: room.players.map(p => ({
-              id: p.id,
-              name: p.name,
-              isAlive: p.isAlive,
-              disconnected: p.disconnected || false,
-              isBot: p.isBot || false,
-              ready: p.ready || false
-            })),
-            // Estado de espera
-            waitingForReconnect: hasDisconnectedPlayers(roomId),
-            disconnectedPlayers: getDisconnectedPlayers(roomId)
+            keyword: player.role === 'ASESINO' ? room.keyword : null
           }
         });
         
@@ -238,9 +187,16 @@ io.on('connection', (socket) => {
         console.log(`Jugador ${playerName} reconectado a sala ${roomId} (fase: ${currentPhase})`);
         io.to(roomId).emit('roomUpdate', room);
         io.to(roomId).emit('playerReconnected', { playerName });
-        
-        // Notificar que ya no estamos esperando (si era el último desconectado)
-        notifyWaitingState(roomId);
+
+        // Verificar si quedan otros desconectados
+        const remainingDisconnected = room.players.filter(p => p.disconnected);
+        if (remainingDisconnected.length === 0) {
+          io.to(roomId).emit('gameResumed');
+        } else {
+          io.to(roomId).emit('gamePaused', { 
+            disconnectedPlayers: remainingDisconnected.map(p => p.name) 
+          });
+        }
         return;
       }
     }
@@ -303,57 +259,37 @@ io.on('connection', (socket) => {
         // Si el juego ya comenzó, marcar como desconectado pero no eliminar
         if (room.phase && room.phase !== 'lobby') {
           player.disconnected = true;
-          player.disconnectedAt = Date.now();
           const disconnectKey = `${roomId}_${player.name}`;
           
           console.log(`Jugador ${player.name} desconectado de sala ${roomId} (en juego). Esperando reconexión...`);
-          
-          // Notificar a todos que el juego está en pausa esperando reconexión
-          notifyWaitingState(roomId);
           
           // Guardar datos para reconexión
           disconnectedPlayers[disconnectKey] = {
             roomId,
             playerName: player.name,
             playerData: { ...player },
-            disconnectedAt: Date.now(),
             timeout: setTimeout(() => {
-              // Si no reconecta en el tiempo de gracia, convertir en bot
+              // Si no reconecta en el tiempo de gracia, eliminar
               console.log(`Timeout de reconexión para ${player.name} en sala ${roomId}`);
               const currentRoom = rooms[roomId];
               if (currentRoom) {
                 const pIndex = currentRoom.players.findIndex(p => p.name === player.name);
                 if (pIndex !== -1 && currentRoom.players[pIndex].disconnected) {
-                  // Convertir en bot
+                  // Convertir en bot o eliminar
                   currentRoom.players[pIndex].isBot = true;
                   currentRoom.players[pIndex].disconnected = false;
-                  currentRoom.players[pIndex].disconnectedAt = null;
                   console.log(`Jugador ${player.name} convertido en bot`);
                   io.to(roomId).emit('roomUpdate', currentRoom);
                   io.to(roomId).emit('playerConvertedToBot', { playerName: player.name });
-                  
-                  // Notificar que ya no estamos esperando
-                  notifyWaitingState(roomId);
-                  
-                  // Verificar si hay acciones pendientes que el bot debe hacer
-                  const phase = currentRoom.phase;
-                  if (phase === 'leaderVote') {
-                    // Bot vota en votación de líder
-                    const alivePlayers = currentRoom.players.filter(p => p.isAlive);
-                    if (alivePlayers.length > 0) {
-                      const randomTarget = alivePlayers[Math.floor(Math.random() * alivePlayers.length)];
-                      handleLeaderVote(roomId, currentRoom.players[pIndex].id, randomTarget.id);
-                    }
-                  } else if (phase === 'eliminationVote') {
-                    // Bot vota en votación de eliminación
-                    const alivePlayers = currentRoom.players.filter(p => p.isAlive && p.id !== currentRoom.players[pIndex].id);
-                    if (alivePlayers.length > 0) {
-                      const randomTarget = alivePlayers[Math.floor(Math.random() * alivePlayers.length)];
-                      handleEliminationVote(roomId, currentRoom.players[pIndex].id, randomTarget.id);
-                    }
-                  } else if (phase === 'night') {
-                    // Bot realiza acción nocturna
-                    handleBotNightActions(roomId);
+
+                  // Verificar si quedan jugadores desconectados
+                  const remainingDisconnected = currentRoom.players.filter(p => p.disconnected);
+                  if (remainingDisconnected.length === 0) {
+                    io.to(roomId).emit('gameResumed');
+                  } else {
+                     io.to(roomId).emit('gamePaused', { 
+                       disconnectedPlayers: remainingDisconnected.map(p => p.name) 
+                     });
                   }
                 }
               }
@@ -361,12 +297,13 @@ io.on('connection', (socket) => {
             }, RECONNECT_TIMEOUT)
           };
           
-          io.to(roomId).emit('playerDisconnected', { 
-            playerName: player.name,
-            timeout: RECONNECT_TIMEOUT,
-            disconnectedAt: player.disconnectedAt
-          });
+          io.to(roomId).emit('playerDisconnected', { playerName: player.name });
           io.to(roomId).emit('roomUpdate', room);
+
+          // PAUSAR JUEGO
+          io.to(roomId).emit('gamePaused', { 
+            disconnectedPlayers: room.players.filter(p => p.disconnected).map(p => p.name) 
+          });
         } else {
           // Si estamos en lobby, eliminar al jugador
           room.players.splice(playerIndex, 1);
@@ -458,18 +395,17 @@ io.on('connection', (socket) => {
     room.assassinSkippedCount = 0;
     room.saboteurRecruited = false;
 
-    // Enviar rol y fragmento a cada jugador (fragmentos indexados por nombre)
+    // Enviar rol y fragmento a cada jugador
     players.forEach((player) => {
       if (player.isBot) {
         player.ready = true; // Bots listos automáticamente
       } else {
-        const fragment = fragments[player.name] || null;
-        console.log(`Sending role to ${player.name} (${player.role}): fragment=${fragment}`);
+        console.log(`Sending role to ${player.name} (${player.role}): fragment=${fragments[player.id]}`);
         io.to(player.id).emit('roleAssigned', { 
           role: player.role, 
           name: player.name, 
           roomId,
-          fragment: fragment
+          fragment: fragments[player.id] || null
         });
       }
     });
@@ -599,19 +535,9 @@ io.on('connection', (socket) => {
 
     // Registrar voto
     room.leaderVotes[voterId].push(candidateId);
-    
-    // Emitir actualización de votos a todos (para mostrar progreso)
-    const alivePlayers = room.players.filter(p => p.isAlive && !p.disconnected);
-    const totalNeeded = alivePlayers.reduce((sum, p) => sum + ((room.doubleVotePlayer === p.id) ? 2 : 1), 0);
-    const totalVotes = Object.values(room.leaderVotes).reduce((sum, arr) => sum + arr.length, 0);
-    io.to(roomId).emit('voteProgress', { current: totalVotes, total: totalNeeded, type: 'leader' });
 
-    // Verificar si todos los vivos (no desconectados) han completado sus votos
-    // NO procesar resultado si hay jugadores desconectados
-    if (hasDisconnectedPlayers(roomId)) {
-      console.log(`Esperando reconexión de jugadores antes de procesar votación de líder`);
-      return;
-    }
+    // Verificar si todos los vivos han completado sus votos
+    const alivePlayers = room.players.filter(p => p.isAlive);
     
     // Contar cuántos jugadores han completado sus votos
     const completedVoters = alivePlayers.filter(p => {
@@ -754,18 +680,8 @@ io.on('connection', (socket) => {
     if (room.eliminationVotes[voterId].length >= maxVotes) return;
 
     room.eliminationVotes[voterId].push(candidateId);
-    
-    // Emitir actualización de votos a todos (para mostrar progreso)
-    const alivePlayers = room.players.filter(p => p.isAlive && !p.disconnected);
-    const totalNeeded = alivePlayers.reduce((sum, p) => sum + ((room.doubleVotePlayer === p.id) ? 2 : 1), 0);
-    const totalVotes = Object.values(room.eliminationVotes).reduce((sum, arr) => sum + arr.length, 0);
-    io.to(roomId).emit('voteProgress', { current: totalVotes, total: totalNeeded, type: 'elimination' });
-    
-    // NO procesar resultado si hay jugadores desconectados
-    if (hasDisconnectedPlayers(roomId)) {
-      console.log(`Esperando reconexión de jugadores antes de procesar votación de eliminación`);
-      return;
-    }
+
+    const alivePlayers = room.players.filter(p => p.isAlive);
     
     // Contar cuántos jugadores han completado sus votos
     const completedVoters = alivePlayers.filter(p => {
@@ -1030,9 +946,6 @@ io.on('connection', (socket) => {
          }
          return false;
       }
-      
-      // Si está desconectado, cuenta como pendiente
-      if (p.disconnected) return true;
 
       // Para humanos, deben estar en el set de 'nightReady'
       if (!room.nightReady) return true;
@@ -1042,12 +955,6 @@ io.on('connection', (socket) => {
     // Emitir estado de espera a todos
     const readyCount = alivePlayers.length - pendingPlayers.length;
     io.to(roomId).emit('nightWaitUpdate', { ready: readyCount, total: alivePlayers.length });
-
-    // NO resolver si hay jugadores desconectados
-    if (hasDisconnectedPlayers(roomId)) {
-      console.log(`Esperando reconexión de jugadores antes de resolver fase nocturna`);
-      return;
-    }
 
     if (pendingPlayers.length === 0) {
       resolveNightPhase(roomId);
@@ -1421,12 +1328,12 @@ io.on('connection', (socket) => {
     const fragments = generateFragments(room.keyword, room.players);
     room.fragments = fragments;
 
-    // Enviar rol y fragmento a cada jugador (fragmentos indexados por nombre)
+    // Enviar rol y fragmento a cada jugador (igual que en startGame)
     room.players.forEach((player) => {
       player.ready = false; // Reiniciar estado de listo
       
-      // Determinar si fue saboteado (sabotagedPlayerIds usa IDs, pero también chequeamos nombres)
-      let fragmentToSend = fragments[player.name] || null;
+      // Determinar si fue saboteado
+      let fragmentToSend = fragments[player.id];
       let isSabotaged = false;
       let foundSecretWord = false;
       

@@ -393,27 +393,24 @@ const KEYWORD_POOL = {
 
 // Generar palabra clave aleatoria
 
-// Generar fragmentos para cada jugador (indexados por nombre para persistir en reconexiones)
+// Generar fragmentos para cada jugador
 const generateFragments = (keyword, players) => {
   const fragments = {};
   const availableFragments = [...KEYWORD_POOL[keyword]];
   
   players.forEach(player => {
-    // Usar nombre como clave para que persista en reconexiones
-    const key = player.name || player.id;
-    
     if (player.role === ROLES.ASESINO && player.isAlive) {
       // El asesino vivo recibe la palabra secreta
-      fragments[key] = keyword;
+      fragments[player.id] = keyword;
     } else {
       // Los demás reciben fragmentos aleatorios
       if (availableFragments.length > 0) {
         const randomIndex = Math.floor(Math.random() * availableFragments.length);
-        fragments[key] = availableFragments.splice(randomIndex, 1)[0];
+        fragments[player.id] = availableFragments.splice(randomIndex, 1)[0];
       } else {
         // Si se agotan los fragmentos, usar uno aleatorio del pool original
         const originalFragments = KEYWORD_POOL[keyword];
-        fragments[key] = originalFragments[Math.floor(Math.random() * originalFragments.length)];
+        fragments[player.id] = originalFragments[Math.floor(Math.random() * originalFragments.length)];
       }
     }
   });
