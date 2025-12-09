@@ -175,7 +175,16 @@ io.on('connection', (socket) => {
             navigateTo: phaseMap[currentPhase] || '/day-phase',
             day: room.day || 1,
             leader: room.leader,
-            keyword: player.role === 'ASESINO' ? room.keyword : null
+            keyword: player.role === 'ASESINO' ? room.keyword : null,
+            players: room.players,
+            votes: room.votes || {},
+            sabotages: room.sabotages || [],
+            isSabotaged: room.isSabotaged || false,
+            foundSecretWord: room.foundSecretWord || false,
+            fragments: room.fragments || {}, // Fragmentos públicos si los hubiera
+            winner: room.winner || null,
+            winningTeam: room.winningTeam || null,
+            deadPlayers: room.deadPlayers || []
           }
         });
         
@@ -187,16 +196,6 @@ io.on('connection', (socket) => {
         console.log(`Jugador ${playerName} reconectado a sala ${roomId} (fase: ${currentPhase})`);
         io.to(roomId).emit('roomUpdate', room);
         io.to(roomId).emit('playerReconnected', { playerName });
-
-        // Verificar si quedan otros desconectados
-        const remainingDisconnected = room.players.filter(p => p.disconnected);
-        if (remainingDisconnected.length === 0) {
-          io.to(roomId).emit('gameResumed');
-        } else {
-          io.to(roomId).emit('gamePaused', { 
-            disconnectedPlayers: remainingDisconnected.map(p => p.name) 
-          });
-        }
         return;
       }
     }
@@ -281,16 +280,6 @@ io.on('connection', (socket) => {
                   console.log(`Jugador ${player.name} convertido en bot`);
                   io.to(roomId).emit('roomUpdate', currentRoom);
                   io.to(roomId).emit('playerConvertedToBot', { playerName: player.name });
-
-                  // Verificar si quedan jugadores desconectados
-                  const remainingDisconnected = currentRoom.players.filter(p => p.disconnected);
-                  if (remainingDisconnected.length === 0) {
-                    io.to(roomId).emit('gameResumed');
-                  } else {
-                     io.to(roomId).emit('gamePaused', { 
-                       disconnectedPlayers: remainingDisconnected.map(p => p.name) 
-                     });
-                  }
                 }
               }
               delete disconnectedPlayers[disconnectKey];
@@ -299,11 +288,6 @@ io.on('connection', (socket) => {
           
           io.to(roomId).emit('playerDisconnected', { playerName: player.name });
           io.to(roomId).emit('roomUpdate', room);
-
-          // PAUSAR JUEGO
-          io.to(roomId).emit('gamePaused', { 
-            disconnectedPlayers: room.players.filter(p => p.disconnected).map(p => p.name) 
-          });
         } else {
           // Si estamos en lobby, eliminar al jugador
           room.players.splice(playerIndex, 1);
